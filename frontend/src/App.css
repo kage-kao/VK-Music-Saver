@@ -1,0 +1,24 @@
+/* App.css - VK Music Saver */
+.App {
+  min-height: 100vh;
+  background: #09090b;
+}
+
+/* Mobile fixes */
+@media (max-width: 640px) {
+  .mode-selector-mobile {
+    display: flex;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    width: 100%;
+  }
+  .mode-selector-mobile::-webkit-scrollbar {
+    display: none;
+  }
+  .mode-selector-mobile > button {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+}
