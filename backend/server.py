@@ -58,6 +58,7 @@ XRAY_CONFIG_DIR = Path("/tmp/xray_configs")
 XRAY_CONFIG_DIR.mkdir(exist_ok=True)
 XRAY_BIN = "/usr/local/bin/xray"
 TEMPSHARE_MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+CHUNK_SIZE_LIMIT = 1 * 1024 * 1024 * 1024  # 1GB - FIX BUG #2: chunk threshold
 CONCURRENT_DOWNLOADS = 8
 
 
@@ -221,9 +222,27 @@ def find_free_port():
         return s.getsockname()[1]
 
 
+# FIX BUG #3: Check if xray binary exists before starting
+def check_xray_available():
+    if not os.path.isfile(XRAY_BIN):
+        raise FileNotFoundError(
+            f"Xray не найден по пути {XRAY_BIN}. "
+            "Установите Xray для поддержки VLESS прокси: "
+            "запустите deploy.sh или скачайте вручную с https://github.com/XTLS/Xray-core/releases"
+        )
+    if not os.access(XRAY_BIN, os.X_OK):
+        raise PermissionError(
+            f"Xray найден ({XRAY_BIN}), но не имеет прав на выполнение. "
+            "Выполните: chmod +x /usr/local/bin/xray"
+        )
+
+
 async def start_xray_for_proxy(proxy_id: str, vless_uri: str) -> dict:
     await stop_xray_for_proxy(proxy_id)
     try:
+        # FIX BUG #3: Check xray exists before attempting to run
+        check_xray_available()
+
         vless_params = parse_vless_uri(vless_uri)
         local_port = find_free_port()
         config = generate_xray_config(vless_params, local_port)
@@ -244,6 +263,9 @@ async def start_xray_for_proxy(proxy_id: str, vless_uri: str) -> dict:
         }
         logger.info(f"Xray started for proxy {proxy_id} on port {local_port}")
         return {"port": local_port, "status": "running"}
+    except (FileNotFoundError, PermissionError) as e:
+        logger.error(f"Xray not available for {proxy_id}: {e}")
+        raise
     except Exception as e:
         logger.error(f"Failed to start xray for {proxy_id}: {e}")
         raise
@@ -699,47 +721,17 @@ async def update_task_status(task_id, status, **kwargs):
     await db.download_history.update_one({"id": task_id}, {"$set": update})
 
 
-def split_zip_files(zip_path, max_size=TEMPSHARE_MAX_SIZE):
-    file_size = os.path.getsize(str(zip_path))
-    if file_size <= max_size:
-        return [str(zip_path)]
-
-    parts = []
-    base_name = str(zip_path).replace('.zip', '')
-
-    with zipfile.ZipFile(str(zip_path), 'r') as src_zip:
-        all_names = src_zip.namelist()
-        part_num = 1
-        current_size = 0
-        current_names = []
-
-        for name in all_names:
-            info = src_zip.getinfo(name)
-            entry_size = info.compress_size + 100
-
-            if current_size + entry_size > max_size * 0.95 and current_names:
-                part_path = f"{base_name}_part{part_num}.zip"
-                with zipfile.ZipFile(part_path, 'w', zipfile.ZIP_DEFLATED) as part_zip:
-                    for n in current_names:
-                        part_zip.writestr(src_zip.getinfo(n), src_zip.read(n))
-                parts.append(part_path)
-                part_num += 1
-                current_names = []
-                current_size = 0
-
-            current_names.append(name)
-            current_size += entry_size
-
-        if current_names:
-            part_path = f"{base_name}_part{part_num}.zip"
-            with zipfile.ZipFile(part_path, 'w', zipfile.ZIP_DEFLATED) as part_zip:
-                for n in current_names:
-                    part_zip.writestr(src_zip.getinfo(n), src_zip.read(n))
-            parts.append(part_path)
-
-    return parts
+def get_dir_size(dir_path):
+    total = 0
+    for f in Path(dir_path).iterdir():
+        if f.is_file():
+            total += f.stat().st_size
+    return total
 
 
+# FIX BUG #2: Chunked download with 1GB threshold
+# Downloads tracks, when accumulated size reaches ~1GB:
+# stop -> zip -> upload to tempshare -> save link -> clean cache -> continue
 async def download_tracks_batch(task_id, token, tracks, title, add_tags=False, add_lyrics=False, quality="high"):
     try:
         if active_cancel_flags.get(task_id):
@@ -772,52 +764,150 @@ async def download_tracks_batch(task_id, token, tracks, title, add_tags=False, a
             http_session = aiohttp.ClientSession()
             http_proxy = proxy_url if proxy_url and proxy_url.startswith("http") else None
 
-        downloaded_count = 0
+        total_downloaded = 0
+        chunk_part = 0
+        upload_urls = []
+        total_size_all = 0
         semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 
-        async def download_one(i, track):
-            nonlocal downloaded_count
+        # Process tracks in sequential chunks to control disk usage
+        i = 0
+        while i < len(valid_tracks):
             if active_cancel_flags.get(task_id):
-                return
+                break
 
-            async with semaphore:
+            # Download tracks until we hit ~1GB or run out
+            chunk_files = []
+            chunk_size = 0
+
+            async def download_one_track(track_idx, track):
+                nonlocal chunk_size
                 if active_cancel_flags.get(task_id):
-                    return
+                    return None
 
-                artist = track.get('artist', 'Unknown')
-                track_title = track.get('title', 'Unknown')
-                url = track.get('url', '')
+                async with semaphore:
+                    if active_cancel_flags.get(task_id):
+                        return None
 
-                safe_name = re.sub(r'[<>:"/\\|?*]', '_', f"{i+1:03d}. {artist} - {track_title}")
-                filepath = task_dir / f"{safe_name}.mp3"
+                    artist = track.get('artist', 'Unknown')
+                    track_title = track.get('title', 'Unknown')
+                    url = track.get('url', '')
 
-                success = await download_track_file(http_session, url, str(filepath), http_proxy=http_proxy)
+                    # FIX BUG #1: Limit filename length to 200 chars to avoid Linux 255-byte limit
+                    safe_name = re.sub(r'[<>:"/\\|?*]', '_', f"{track_idx+1:03d}. {artist} - {track_title}")[:200]
+                    filepath = task_dir / f"{safe_name}.mp3"
 
-                if success:
-                    downloaded_count += 1
+                    success = await download_track_file(http_session, url, str(filepath), http_proxy=http_proxy)
 
-                    if add_tags and HAS_MUTAGEN:
-                        cover_data = await fetch_cover(http_session, track, http_proxy=http_proxy)
-                        lyrics_text = None
-                        if add_lyrics and track.get('lyrics_id'):
-                            lyrics_text = await get_lyrics(token, track['lyrics_id'])
-                        await apply_id3_tags(filepath, track, cover_data, lyrics_text)
+                    if success:
+                        file_size = filepath.stat().st_size if filepath.exists() else 0
+                        chunk_size += file_size
 
-                    progress = (downloaded_count / actual_count) * 80
-                    await update_task_status(
-                        task_id, "downloading",
-                        progress=progress,
-                        current_track=f"{artist} - {track_title}",
-                        downloaded_count=downloaded_count
-                    )
+                        if add_tags and HAS_MUTAGEN:
+                            cover_data = await fetch_cover(http_session, track, http_proxy=http_proxy)
+                            lyrics_text = None
+                            if add_lyrics and track.get('lyrics_id'):
+                                lyrics_text = await get_lyrics(token, track['lyrics_id'])
+                            await apply_id3_tags(filepath, track, cover_data, lyrics_text)
 
-        try:
-            await update_task_status(task_id, "downloading", progress=0.0, current_track="Starting downloads...")
+                        return str(filepath)
+                    return None
 
-            tasks = [download_one(i, track) for i, track in enumerate(valid_tracks)]
-            await asyncio.gather(*tasks)
-        finally:
-            await http_session.close()
+            # Download tracks one-by-one or in small batches, checking size after each
+            batch_start = i
+            while i < len(valid_tracks) and chunk_size < CHUNK_SIZE_LIMIT:
+                if active_cancel_flags.get(task_id):
+                    break
+
+                # Download a small batch of up to CONCURRENT_DOWNLOADS tracks
+                batch_end = min(i + CONCURRENT_DOWNLOADS, len(valid_tracks))
+                batch_tasks = []
+                for j in range(i, batch_end):
+                    batch_tasks.append(download_one_track(j, valid_tracks[j]))
+
+                results = await asyncio.gather(*batch_tasks)
+                for r in results:
+                    if r:
+                        chunk_files.append(r)
+                        total_downloaded += 1
+
+                i = batch_end
+
+                # Update progress
+                progress = (total_downloaded / actual_count) * 80
+                current_artist = valid_tracks[min(i - 1, len(valid_tracks) - 1)].get('artist', '')
+                current_title = valid_tracks[min(i - 1, len(valid_tracks) - 1)].get('title', '')
+                await update_task_status(
+                    task_id, "downloading",
+                    progress=progress,
+                    current_track=f"{current_artist} - {current_title}",
+                    downloaded_count=total_downloaded
+                )
+
+                # Check if we've hit the chunk size limit
+                if chunk_size >= CHUNK_SIZE_LIMIT:
+                    break
+
+            if active_cancel_flags.get(task_id):
+                break
+
+            # If we have files in this chunk, zip and upload them
+            if chunk_files:
+                chunk_part += 1
+                total_size_all += chunk_size
+
+                await update_task_status(task_id, "zipping", progress=80 + (chunk_part * 2),
+                                         current_track=f"Создание архива (часть {chunk_part})...")
+
+                safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:150]
+                part_suffix = f"_part{chunk_part}" if (chunk_size >= CHUNK_SIZE_LIMIT or chunk_part > 1) else ""
+                zip_filename = f"{safe_title}_{task_id[:8]}{part_suffix}.zip"
+                zip_path = DOWNLOAD_DIR / zip_filename
+
+                loop = asyncio.get_event_loop()
+                def create_chunk_zip(files_to_zip, zpath):
+                    with zipfile.ZipFile(str(zpath), 'w', zipfile.ZIP_STORED) as zf:
+                        for fpath in sorted(files_to_zip):
+                            zf.write(fpath, os.path.basename(fpath))
+
+                await loop.run_in_executor(None, create_chunk_zip, chunk_files, zip_path)
+
+                # Check if zip itself exceeds 2GB and needs splitting
+                zip_file_size = os.path.getsize(str(zip_path))
+                if zip_file_size > TEMPSHARE_MAX_SIZE:
+                    # Split the zip
+                    split_parts = await loop.run_in_executor(None, split_zip_files, zip_path)
+                    for sp_idx, sp_path in enumerate(split_parts):
+                        await update_task_status(task_id, "uploading",
+                                                 progress=82 + (chunk_part * 3),
+                                                 current_track=f"Загрузка части {chunk_part}.{sp_idx + 1}...")
+                        result = await upload_to_tempshare(sp_path)
+                        if result.get("success"):
+                            upload_urls.append(result.get("url", ""))
+                        else:
+                            logger.error(f"Upload failed for split part: {result.get('error')}")
+                        if os.path.exists(sp_path):
+                            os.remove(sp_path)
+                else:
+                    await update_task_status(task_id, "uploading",
+                                             progress=82 + (chunk_part * 3),
+                                             current_track=f"Загрузка части {chunk_part}...")
+                    result = await upload_to_tempshare(str(zip_path))
+                    if result.get("success"):
+                        upload_urls.append(result.get("url", ""))
+                    else:
+                        logger.error(f"Upload failed: {result.get('error')}")
+
+                # Clean up: remove zip and downloaded track files to free disk space
+                if zip_path.exists():
+                    os.remove(str(zip_path))
+                for fpath in chunk_files:
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+
+                logger.info(f"Chunk {chunk_part} uploaded and cleaned. Tracks so far: {total_downloaded}/{actual_count}")
+
+        await http_session.close()
 
         if active_cancel_flags.get(task_id):
             shutil.rmtree(str(task_dir), ignore_errors=True)
@@ -825,77 +915,77 @@ async def download_tracks_batch(task_id, token, tracks, title, add_tags=False, a
             await update_task_status(task_id, "cancelled", error_message="Cancelled by user")
             return
 
-        await db.download_history.update_one({"id": task_id}, {"$set": {"downloaded_count": downloaded_count}})
+        await db.download_history.update_one({"id": task_id}, {"$set": {"downloaded_count": total_downloaded}})
 
-        if downloaded_count == 0:
+        if total_downloaded == 0:
             shutil.rmtree(str(task_dir), ignore_errors=True)
             await update_task_status(task_id, "error", error_message="Не удалось скачать ни одного трека. Скорее всего, сервер находится за пределами России и треки ограничены по региону. Подключите российский прокси в настройках.")
             return
 
-        await update_task_status(task_id, "zipping", progress=82.0, current_track="Creating ZIP archive...")
+        if not upload_urls:
+            shutil.rmtree(str(task_dir), ignore_errors=True)
+            await update_task_status(task_id, "error", error_message="Не удалось загрузить архив на TempShare.")
+            return
 
-        safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
-        zip_path = DOWNLOAD_DIR / f"{safe_title}_{task_id[:8]}.zip"
-
-        loop = asyncio.get_event_loop()
-        def create_zip():
-            with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_STORED) as zf:
-                for file in sorted(task_dir.iterdir()):
-                    if file.is_file():
-                        zf.write(str(file), file.name)
-        await loop.run_in_executor(None, create_zip)
-
-        file_size = os.path.getsize(str(zip_path))
-        size_str = format_size(file_size)
-
-        zip_parts = await loop.run_in_executor(None, split_zip_files, zip_path)
-
-        await update_task_status(task_id, "uploading", progress=88.0, current_track="Uploading to TempShare...")
-
-        upload_urls = []
-        total_parts = len(zip_parts)
-        for idx, part_path in enumerate(zip_parts):
-            if active_cancel_flags.get(task_id):
-                break
-            progress = 88.0 + (idx / total_parts) * 12
-            part_label = f" (part {idx+1}/{total_parts})" if total_parts > 1 else ""
-            await update_task_status(task_id, "uploading", progress=progress, current_track=f"Uploading{part_label}...")
-            result = await upload_to_tempshare(part_path)
-            if result.get("success"):
-                upload_urls.append(result.get("url", ""))
-            else:
-                await update_task_status(task_id, "error", error_message=f"Upload error: {result.get('error', 'Unknown')}")
-                shutil.rmtree(str(task_dir), ignore_errors=True)
-                for p in zip_parts:
-                    if os.path.exists(p):
-                        os.remove(p)
-                if zip_path.exists():
-                    os.remove(str(zip_path))
-                return
-
-        if upload_urls:
-            await update_task_status(
-                task_id, "completed", progress=100.0,
-                download_url=upload_urls[0],
-                download_urls=upload_urls,
-                file_size=size_str,
-                current_track="",
-                downloaded_count=downloaded_count
-            )
-            await db.download_history.update_one({"id": task_id}, {"$set": {"completed_at": datetime.now(timezone.utc).isoformat()}})
+        size_str = format_size(total_size_all)
+        await update_task_status(
+            task_id, "completed", progress=100.0,
+            download_url=upload_urls[0],
+            download_urls=upload_urls,
+            file_size=size_str,
+            current_track="",
+            downloaded_count=total_downloaded
+        )
+        await db.download_history.update_one({"id": task_id}, {"$set": {"completed_at": datetime.now(timezone.utc).isoformat()}})
 
         shutil.rmtree(str(task_dir), ignore_errors=True)
-        for p in zip_parts:
-            if os.path.exists(p):
-                os.remove(p)
-        if zip_path.exists():
-            os.remove(str(zip_path))
         active_cancel_flags.pop(task_id, None)
 
     except Exception as e:
         logger.error(f"Download task error {task_id}: {e}")
         await update_task_status(task_id, "error", error_message=str(e)[:300])
         active_cancel_flags.pop(task_id, None)
+
+
+def split_zip_files(zip_path, max_size=TEMPSHARE_MAX_SIZE):
+    file_size = os.path.getsize(str(zip_path))
+    if file_size <= max_size:
+        return [str(zip_path)]
+
+    parts = []
+    base_name = str(zip_path).replace('.zip', '')
+
+    with zipfile.ZipFile(str(zip_path), 'r') as src_zip:
+        all_names = src_zip.namelist()
+        part_num = 1
+        current_size = 0
+        current_names = []
+
+        for name in all_names:
+            info = src_zip.getinfo(name)
+            entry_size = info.compress_size + 100
+
+            if current_size + entry_size > max_size * 0.95 and current_names:
+                part_path = f"{base_name}_split{part_num}.zip"
+                with zipfile.ZipFile(part_path, 'w', zipfile.ZIP_DEFLATED) as part_zip:
+                    for n in current_names:
+                        part_zip.writestr(src_zip.getinfo(n), src_zip.read(n))
+                parts.append(part_path)
+                part_num += 1
+                current_names = []
+                current_size = 0
+
+            current_names.append(name)
+            current_size += entry_size
+
+        if current_names:
+            part_path = f"{base_name}_split{part_num}.zip"
+            with zipfile.ZipFile(part_path, 'w', zipfile.ZIP_DEFLATED) as part_zip:
+                for n in current_names:
+                    part_zip.writestr(src_zip.getinfo(n), src_zip.read(n))
+            parts.append(part_path)
+
+    return parts
 
 
 async def process_playlist_download(task_id, session_id, playlist_url, add_tags=False, add_lyrics=False, quality="high"):
